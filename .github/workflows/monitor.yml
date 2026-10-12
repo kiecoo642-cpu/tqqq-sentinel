@@ -1,0 +1,51 @@
+name: TQQQ LRS State Flip Monitor
+
+on:
+  schedule:
+    # UTC 23:30 对应北京时间次日早晨 07:30 (周一至周五 UTC，对应北京时间周二至周六)
+    # 对应美东时间盘后 18:30 (冬令时) / 19:30 (夏令时)，收盘与除权数据已完全落定
+    - cron: '30 23 * * 1-5'
+  workflow_dispatch: # 支持手动点击运行测试
+
+permissions:
+  contents: write # 允许 Action 自动提交更新后的 state.json
+
+jobs:
+  check-signal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # 防止外部数据源卡死耗尽 Runner 配额
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Sentinel
+        env:
+          # 推荐使用 WEBHOOK_URL（自动识别飞书 / 企业微信 / 钉钉群机器人，无需区分变量名）
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }} # 可选：钉钉/飞书开启加签时的密钥
+          # 也支持单独指定特定平台或叠加备份通道：
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          WEWORK_WEBHOOK: ${{ secrets.WEWORK_WEBHOOK }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: |
+          python main.py
+
+      - name: Commit & Push state if changed
+        if: success()
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add state.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "chore: auto-update LRS state [skip ci]" && git push)
