@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -6,20 +7,24 @@ import os
 import sys
 import time
 import urllib.parse
+import uuid
 from datetime import datetime, timezone
 import pandas as pd
 import requests
+import websockets
 import yfinance as yf
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 SYMBOL = "QQQ"
 VALID_STATES = {"LONG", "CASH", "UNKNOWN"}
 SCHEMA_VERSION = 1
+WECOM_WS_URL = "wss://openws.work.weixin.qq.com"
+DEFAULT_WECOM_BOT_ID = "aibgfcGQIift46DGz-HSNR9vI6wn4hNIzWt"
 
 
-def _clean_env(key):
+def _clean_env(key, default=""):
     """读取环境变量并自动剥离首尾空白与误粘贴的单双引号"""
-    return os.getenv(key, "").strip().strip('"').strip("'")
+    return os.getenv(key, default).strip().strip('"').strip("'")
 
 
 def get_qqq_data_with_retry(retries=3, delay=5):
@@ -124,10 +129,137 @@ def load_previous_state():
 
 
 def save_current_state(state_data):
-    """持久化当前状态"""
+    """持久化当前状态（保留已有扩展字段如 wecom_chat_id）"""
+    existing = {}
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
+                loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing = loaded
+        except Exception:
+            pass
+    existing.update(state_data)
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state_data, f, indent=2, ensure_ascii=False)
+        json.dump(existing, f, indent=2, ensure_ascii=False)
         f.write("\n")
+
+
+async def _wecom_aibot_send_async(bot_id, secret, chat_id, title, content):
+    """通过企业微信智能机器人长连接 (wss://openws.work.weixin.qq.com) 主动推送 Markdown 消息"""
+    sub_req_id = f"aibot_subscribe_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    send_req_id = f"aibot_send_msg_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+    async with websockets.connect(WECOM_WS_URL, open_timeout=10, close_timeout=5) as ws:
+        # 1. 发送 aibot_subscribe 鉴权帧
+        await ws.send(
+            json.dumps(
+                {
+                    "cmd": "aibot_subscribe",
+                    "headers": {"req_id": sub_req_id},
+                    "body": {"bot_id": bot_id, "secret": secret},
+                }
+            )
+        )
+        raw_auth = await asyncio.wait_for(ws.recv(), timeout=10)
+        auth_resp = json.loads(raw_auth)
+        if auth_resp.get("errcode") != 0:
+            raise RuntimeError(f"长连接鉴权失败: {auth_resp}")
+
+        # 2. 发送 aibot_send_msg 主动推送帧
+        await ws.send(
+            json.dumps(
+                {
+                    "cmd": "aibot_send_msg",
+                    "headers": {"req_id": send_req_id},
+                    "body": {
+                        "chatid": chat_id,
+                        "msgtype": "markdown",
+                        "markdown": {"content": f"## {title}\n{content}"},
+                    },
+                }
+            )
+        )
+        # 读取回执（跳过可能穿插的服务端事件帧）
+        for _ in range(5):
+            raw_ack = await asyncio.wait_for(ws.recv(), timeout=10)
+            ack = json.loads(raw_ack)
+            if ack.get("headers", {}).get("req_id") == send_req_id or "errcode" in ack:
+                print(f"[企微智能机器人长连接] 推送响应: {raw_ack}")
+                if ack.get("errcode") == 0:
+                    return True
+                raise RuntimeError(f"主动推送返回错误: {ack}")
+    return False
+
+
+async def bind_wecom_aibot_interactive(bot_id, secret, timeout_sec=120):
+    """
+    一键绑定向导：建立长连接等待用户在手机端向机器人发任意消息，自动捕获 chatid 写入 state.json 并回复测试卡片
+    """
+    sub_req_id = f"aibot_subscribe_{int(time.time() * 1000)}"
+    print(f"正在连接企业微信长连接网关 ({WECOM_WS_URL})...")
+    async with websockets.connect(WECOM_WS_URL, open_timeout=10) as ws:
+        await ws.send(
+            json.dumps(
+                {
+                    "cmd": "aibot_subscribe",
+                    "headers": {"req_id": sub_req_id},
+                    "body": {"bot_id": bot_id, "secret": secret},
+                }
+            )
+        )
+        auth_resp = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+        if auth_resp.get("errcode") != 0:
+            sys.exit(f"❌ 鉴权失败，请检查 WECOM_BOT_ID 和 WECOM_BOT_SECRET: {auth_resp}")
+
+        print("✅ 企业微信长连接认证成功！")
+        print(f"👉 请在 {timeout_sec} 秒内打开手机企业微信，向【tqqq BOT】发送任意一句话（例如：1）...")
+
+        start_ts = time.time()
+        while time.time() - start_ts < timeout_sec:
+            try:
+                raw_msg = await asyncio.wait_for(ws.recv(), timeout=20)
+            except asyncio.TimeoutError:
+                # 发送 ping 保活
+                await ws.send(
+                    json.dumps({"cmd": "ping", "headers": {"req_id": f"ping_{int(time.time())}"}})
+                )
+                continue
+
+            frame = json.loads(raw_msg)
+            cmd = frame.get("cmd", "")
+            body = frame.get("body", {})
+            chat_id = body.get("chatid") or body.get("from", {}).get("userid")
+            if cmd in ("aibot_msg_callback", "aibot_event_callback") and chat_id:
+                print(f"🎉 成功捕获会话 ID (chatid): {chat_id}")
+                save_current_state({"wecom_chat_id": chat_id})
+                # 立即通过主动推送接口回发一条演练卡片验证
+                send_req_id = f"aibot_send_msg_{int(time.time() * 1000)}"
+                await ws.send(
+                    json.dumps(
+                        {
+                            "cmd": "aibot_send_msg",
+                            "headers": {"req_id": send_req_id},
+                            "body": {
+                                "chatid": chat_id,
+                                "msgtype": "markdown",
+                                "markdown": {
+                                    "content": (
+                                        "## ✅ TQQQ-LRS 哨兵长连接绑定成功！\n"
+                                        f"- **绑定会话 ID**：`{chat_id}`\n"
+                                        "- **监控状态**：北京时间每周二至周六 07:30 静默监控，变盘即报！"
+                                    )
+                                },
+                            },
+                        }
+                    )
+                )
+                ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                print(f"测试消息回执: {ack}")
+                print("✨ 绑定完成！chatid 已自动保存至 state.json。")
+                return chat_id
+
+        sys.exit("等待超时，未收到机器人会话消息。")
 
 
 def _build_webhook_request(url, title, content, secret=""):
@@ -226,19 +358,19 @@ def _post_with_retry(channel_name, build_req_fn, check_resp_fn, retries=3):
 def send_notification(title, content):
     """
     多通道自适应推送网关：
-    优先支持 企业微信 / 飞书 / 钉钉 群机器人 Webhook（通过 WEBHOOK_URL 自动识别，或分别配置），
-    同时兼容 PUSHPLUS_TOKEN。当配置了多个通道时并发推送，任一主通道成功即视为触达。
+    1. 支持 企业微信智能机器人长连接 (WECOM_BOT_ID + WECOM_BOT_SECRET + WECOM_CHAT_ID)
+    2. 支持 企业微信 / 飞书 / 钉钉 群机器人 Webhook (WEBHOOK_URL)
+    3. 兼容 PUSHPLUS_TOKEN
     """
-    webhook_Secret = _clean_env("WEBHOOK_SECRET")
-    feishu_secret = _clean_env("FEISHU_SECRET") or webhook_Secret
-    dingtalk_secret = _clean_env("DINGTALK_SECRET") or webhook_Secret
+    webhook_secret = _clean_env("WEBHOOK_SECRET")
+    feishu_secret = _clean_env("FEISHU_SECRET") or webhook_secret
+    dingtalk_secret = _clean_env("DINGTALK_SECRET") or webhook_secret
 
-    # 收集所有已配置的 Webhook (去重保序)
     webhook_entries = []
     for raw_url in _clean_env("WEBHOOK_URL").split(","):
         u = raw_url.strip()
         if u:
-            webhook_entries.append((u, webhook_Secret))
+            webhook_entries.append((u, webhook_secret))
 
     if _clean_env("FEISHU_WEBHOOK"):
         webhook_entries.append((_clean_env("FEISHU_WEBHOOK"), feishu_secret))
@@ -254,18 +386,44 @@ def send_notification(title, content):
             seen_urls.add(u)
             unique_webhooks.append((u, sec))
 
+    # 检查企业微信智能机器人长连接配置
+    wecom_bot_id = _clean_env("WECOM_BOT_ID") or DEFAULT_WECOM_BOT_ID
+    wecom_bot_secret = _clean_env("WECOM_BOT_SECRET")
+    cached_state = load_previous_state()
+    wecom_chat_id = _clean_env("WECOM_CHAT_ID") or str(cached_state.get("wecom_chat_id", "")).strip()
+
     pushplus_token = _clean_env("PUSHPLUS_TOKEN")
 
+    has_aibot = bool(wecom_bot_id and wecom_bot_secret and wecom_chat_id)
+
     # 未配置任何推送凭证时，仅控制台输出（本地演练模式）
-    if not unique_webhooks and not pushplus_token:
+    if not unique_webhooks and not has_aibot and not pushplus_token:
         print(
-            f"[LOG - 未配置推送 Webhook/Token，仅控制台输出]\n标题: {title}\n内容:\n{content}"
+            f"[LOG - 未配置推送凭证，仅控制台输出]\n标题: {title}\n内容:\n{content}"
         )
         return True
 
     results = []
 
-    # 1. 发送企业微信 / 飞书 / 钉钉 Webhook
+    # 1. 企业微信智能机器人长连接 (WebSocket)
+    if has_aibot:
+        aibot_ok = False
+        for attempt in range(3):
+            try:
+                if asyncio.run(
+                    _wecom_aibot_send_async(
+                        wecom_bot_id, wecom_bot_secret, wecom_chat_id, title, content
+                    )
+                ):
+                    aibot_ok = True
+                    break
+            except Exception as e:
+                print(f"[WARN] [企微智能机器人长连接] 第 {attempt + 1}/3 次推送异常: {e}")
+                if attempt < 2:
+                    time.sleep(3)
+        results.append(aibot_ok)
+
+    # 2. 企业微信 / 飞书 / 钉钉 Webhook
     for raw_url, secret in unique_webhooks:
         platform_name, _, _ = _build_webhook_request(raw_url, title, content, secret)
 
@@ -274,7 +432,6 @@ def send_notification(title, content):
             return target_url, payload
 
         def check_im_resp(rj):
-            # 飞书: code == 0 或 StatusCode == 0；企微/钉钉: errcode == 0
             if "code" in rj:
                 return rj.get("code") == 0
             if "StatusCode" in rj:
@@ -286,7 +443,7 @@ def send_notification(title, content):
         ok = _post_with_retry(platform_name, make_req, check_im_resp)
         results.append(ok)
 
-    # 2. 发送 PushPlus（若配置了备用通道）
+    # 3. PushPlus 备用通道
     if pushplus_token:
         def make_pp_req():
             return "https://www.pushplus.plus/send", {
@@ -305,6 +462,15 @@ def send_notification(title, content):
 
 
 def main():
+    # 支持通过 `python main.py --bind` 启动企业微信智能机器人长连接会话 ID 自动捕获
+    if "--bind" in sys.argv:
+        bot_id = _clean_env("WECOM_BOT_ID") or DEFAULT_WECOM_BOT_ID
+        secret = _clean_env("WECOM_BOT_SECRET")
+        if not secret:
+            sys.exit("请先设置环境变量 WECOM_BOT_SECRET（企业微信长连接页面 Bot ID 下方的 Secret）再运行 --bind")
+        asyncio.run(bind_wecom_aibot_interactive(bot_id, secret))
+        return
+
     trade_date, close_price, sma_200 = get_qqq_data_with_retry()
     diff_pct = ((close_price - sma_200) / sma_200) * 100
 

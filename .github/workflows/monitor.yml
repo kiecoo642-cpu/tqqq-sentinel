@@ -31,10 +31,13 @@ jobs:
 
       - name: Run Sentinel
         env:
-          # 推荐使用 WEBHOOK_URL（自动识别飞书 / 企业微信 / 钉钉群机器人，无需区分变量名）
+          # 企业微信智能机器人长连接模式 (tqqq BOT)
+          WECOM_BOT_ID: ${{ secrets.WECOM_BOT_ID }}
+          WECOM_BOT_SECRET: ${{ secrets.WECOM_BOT_SECRET }}
+          WECOM_CHAT_ID: ${{ secrets.WECOM_CHAT_ID }}
+          # 群机器人 Webhook 模式（自动识别飞书 / 企业微信 / 钉钉）
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }} # 可选：钉钉/飞书开启加签时的密钥
-          # 也支持单独指定特定平台或叠加备份通道：
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
           FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
           WEWORK_WEBHOOK: ${{ secrets.WEWORK_WEBHOOK }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
