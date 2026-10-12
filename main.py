@@ -19,7 +19,7 @@ SYMBOL = "QQQ"
 VALID_STATES = {"LONG", "CASH", "UNKNOWN"}
 SCHEMA_VERSION = 1
 WECOM_WS_URL = "wss://openws.work.weixin.qq.com"
-DEFAULT_WECOM_BOT_ID = "aibgfcGQIift46DGz-HSNR9vI6wn4hNIzWt"
+DEFAULT_WECOM_BOT_ID = "aibXei11XiQW5OVSVGmg5b2zpNckHjYkCpx"
 
 
 def _clean_env(key, default=""):
@@ -229,31 +229,54 @@ async def bind_wecom_aibot_interactive(bot_id, secret, timeout_sec=120):
             frame = json.loads(raw_msg)
             cmd = frame.get("cmd", "")
             body = frame.get("body", {})
+            req_id = frame.get("headers", {}).get("req_id", "")
             chat_id = body.get("chatid") or body.get("from", {}).get("userid")
             if cmd in ("aibot_msg_callback", "aibot_event_callback") and chat_id:
                 print(f"🎉 成功捕获会话 ID (chatid): {chat_id}")
                 save_current_state({"wecom_chat_id": chat_id})
-                # 立即通过主动推送接口回发一条演练卡片验证
-                send_req_id = f"aibot_send_msg_{int(time.time() * 1000)}"
-                await ws.send(
-                    json.dumps(
-                        {
-                            "cmd": "aibot_send_msg",
-                            "headers": {"req_id": send_req_id},
-                            "body": {
-                                "chatid": chat_id,
-                                "msgtype": "markdown",
-                                "markdown": {
-                                    "content": (
-                                        "## ✅ TQQQ-LRS 哨兵长连接绑定成功！\n"
-                                        f"- **绑定会话 ID**：`{chat_id}`\n"
-                                        "- **监控状态**：北京时间每周二至周六 07:30 静默监控，变盘即报！"
-                                    )
-                                },
-                            },
-                        }
-                    )
+
+                welcome_md = (
+                    "### ✅ TQQQ-LRS 哨兵长连接绑定成功！\n"
+                    f"- **绑定会话 ID**：`{chat_id}`\n"
+                    "- **监控标的**：`QQQ`（官方复权收盘价 vs 200MA）\n"
+                    "- **当前策略状态**：`LONG`（持有 TQQQ）\n"
+                    "- **运行计划**：北京时间每周二至周六 `07:30` 自动巡检，静默监控，变盘即报！"
                 )
+
+                # 若是消息回调，先通过流式响应立即回复
+                if cmd == "aibot_msg_callback" and req_id:
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "cmd": "aibot_respond_msg",
+                                "headers": {"req_id": req_id},
+                                "body": {
+                                    "msgtype": "stream",
+                                    "stream": {
+                                        "id": f"stream_{int(time.time() * 1000)}",
+                                        "content": welcome_md,
+                                        "finish": True,
+                                    },
+                                },
+                            }
+                        )
+                    )
+                else:
+                    # 否则通过主动推送接口发送
+                    send_req_id = f"aibot_send_msg_{int(time.time() * 1000)}"
+                    await ws.send(
+                        json.dumps(
+                            {
+                                "cmd": "aibot_send_msg",
+                                "headers": {"req_id": send_req_id},
+                                "body": {
+                                    "chatid": chat_id,
+                                    "msgtype": "markdown",
+                                    "markdown": {"content": welcome_md},
+                                },
+                            }
+                        )
+                    )
                 ack = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 print(f"测试消息回执: {ack}")
                 print("✨ 绑定完成！chatid 已自动保存至 state.json。")
