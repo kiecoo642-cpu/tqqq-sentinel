@@ -28,9 +28,12 @@ class TestTQQQSentinel(unittest.TestCase):
         self.state_file = os.path.join(self.temp_dir.name, "state.json")
         self.state_patcher = patch.object(sentinel, "STATE_FILE", self.state_file)
         self.state_patcher.start()
+        self.snap_patcher = patch.object(sentinel, "get_market_snapshot", return_value={})
+        self.snap_patcher.start()
         self.env_patcher = patch.dict(os.environ, {}, clear=False)
         self.env_patcher.start()
         for k in (
+            "DAILY_BRIEF",
             "WEBHOOK_URL",
             "WEBHOOK_SECRET",
             "FEISHU_WEBHOOK",
@@ -44,6 +47,7 @@ class TestTQQQSentinel(unittest.TestCase):
 
     def tearDown(self):
         self.env_patcher.stop()
+        self.snap_patcher.stop()
         self.state_patcher.stop()
         self.temp_dir.cleanup()
 
@@ -420,7 +424,8 @@ class TestTQQQSentinel(unittest.TestCase):
         with open(workflow_path, "r", encoding="utf-8") as f:
             yml_text = f.read()
 
-        self.assertIn("cron: '30 23 * * 1-5'", yml_text)
+        self.assertIn("cron: '0 2 * * 2-6'", yml_text)
+        self.assertIn('DAILY_BRIEF: "1"', yml_text)
         self.assertIn("contents: write", yml_text)
         self.assertIn("timeout-minutes: 10", yml_text)
         self.assertIn("if: success()", yml_text)

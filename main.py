@@ -16,6 +16,7 @@ import yfinance as yf
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
 SYMBOL = "QQQ"
+EXTRA_SYMBOLS = ("SPY", "TQQQ")
 VALID_STATES = {"LONG", "CASH", "UNKNOWN"}
 SCHEMA_VERSION = 1
 WECOM_WS_URL = "wss://openws.work.weixin.qq.com"
@@ -27,53 +28,55 @@ def _clean_env(key, default=""):
     return os.getenv(key, default).strip().strip('"').strip("'")
 
 
+def _clean_history_df(df):
+    """清洗日线 DataFrame，兼容 MultiIndex、去除未收盘实时 K 线与重复索引"""
+    if df is None or df.empty:
+        raise ValueError("拉取到的数据为空")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    df = df.rename(columns=str.strip)
+
+    if "Close" not in df.columns:
+        close_cols = [c for c in df.columns if "Close" in str(c)]
+        if not close_cols:
+            raise KeyError(f"未找到 Close 列，当前列: {list(df.columns)}")
+        close_col = close_cols[0]
+    else:
+        close_col = "Close"
+
+    df = df.dropna(subset=[close_col]).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    # 盘中未收盘 K 线过滤：若在美股盘中（美东时间当日 16:00 收盘前）触发，剔除当日未走完的实时日线
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    last_idx = df.index[-1]
+    last_date_et = (
+        last_idx.tz_convert("America/New_York").date()
+        if getattr(last_idx, "tzinfo", None) is not None
+        else last_idx.date()
+    )
+    if last_date_et == now_et.date() and now_et.hour < 16:
+        print(
+            f"[INFO] 检测到美股当前处于盘中或盘前 ({now_et.strftime('%Y-%m-%d %H:%M %Z')})，"
+            f"剔除 {last_date_et} 未收盘实时数据，以最新已收盘交易日为准。"
+        )
+        df = df.iloc[:-1]
+
+    return df, close_col
+
+
 def get_qqq_data_with_retry(retries=3, delay=5):
     """拉取 QQQ 历史日线数据并计算 200MA，带网络重试、MultiIndex 兼容与复权校验"""
     for attempt in range(retries):
         try:
             ticker = yf.Ticker(SYMBOL)
-            # 取近 2 年日线（约 500 个交易日），确保充足覆盖 200 个交易日
             df = ticker.history(period="2y", interval="1d", auto_adjust=True)
-
-            if df is None or df.empty:
-                raise ValueError("拉取到的数据为空")
-
-            # 兼容 yfinance 新版可能返回的 MultiIndex 列名
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df = df.rename(columns=str.strip)
-
-            if "Close" not in df.columns:
-                close_cols = [c for c in df.columns if "Close" in str(c)]
-                if not close_cols:
-                    raise KeyError(f"未找到 Close 列，当前列: {list(df.columns)}")
-                close_col = close_cols[0]
-            else:
-                close_col = "Close"
-
-            df = df.dropna(subset=[close_col])
-            df = df.sort_index()
-            df = df[~df.index.duplicated(keep="last")]
-
-            # 盘中未收盘 K 线过滤：若在美股盘中（美东时间当日 16:00 收盘前）手动触发，剔除当日未走完的实时日线
-            now_et = pd.Timestamp.now(tz="America/New_York")
-            last_idx = df.index[-1]
-            last_date_et = (
-                last_idx.tz_convert("America/New_York").date()
-                if getattr(last_idx, "tzinfo", None) is not None
-                else last_idx.date()
-            )
-            if last_date_et == now_et.date() and now_et.hour < 16:
-                print(
-                    f"[INFO] 检测到美股当前处于盘中或盘前 ({now_et.strftime('%Y-%m-%d %H:%M %Z')})，"
-                    f"剔除 {last_date_et} 未收盘实时数据，以最新已收盘交易日为准。"
-                )
-                df = df.iloc[:-1]
+            df, close_col = _clean_history_df(df)
 
             if len(df) < 200:
                 raise ValueError(f"有效交易日数据不足 200 天，实际获取: {len(df)} 天")
 
-            # 计算 200 日简单移动平均线 (SMA200)
             df["SMA_200"] = df[close_col].rolling(window=200).mean()
 
             latest = df.iloc[-1]
@@ -87,7 +90,6 @@ def get_qqq_data_with_retry(retries=3, delay=5):
                     f"价格数据异常: close={close_price}, sma_200={sma_200}"
                 )
 
-            # 统一转化为美东时间日期，避免跨时区格式化偏差
             latest_idx = df.index[-1]
             if getattr(latest_idx, "tzinfo", None) is not None:
                 latest_idx = latest_idx.tz_convert("America/New_York")
@@ -100,6 +102,35 @@ def get_qqq_data_with_retry(retries=3, delay=5):
                 time.sleep(delay)
 
     sys.exit("无法从 Yahoo Finance 获取有效数据，程序异常退出。")
+
+
+def get_market_snapshot():
+    """
+    拉取 SPY、QQQ、TQQQ 的客观收盘快照（收盘价、单日涨跌幅、200MA 与偏离度）
+    若 SPY/TQQQ 辅助拉取失败不会中断主流程
+    """
+    snapshot = {}
+    for sym in ("SPY", "QQQ", "TQQQ"):
+        try:
+            df = yf.Ticker(sym).history(period="2y", interval="1d", auto_adjust=True)
+            df, close_col = _clean_history_df(df)
+            if len(df) < 200:
+                continue
+            closes = df[close_col]
+            sma200 = float(closes.rolling(window=200).mean().iloc[-1])
+            close_val = float(closes.iloc[-1])
+            prev_val = float(closes.iloc[-2]) if len(closes) >= 2 else close_val
+            ret_1d = ((close_val - prev_val) / prev_val) * 100 if prev_val > 0 else 0.0
+            dist_200 = ((close_val - sma200) / sma200) * 100 if sma200 > 0 else 0.0
+            snapshot[sym] = {
+                "close": round(close_val, 2),
+                "ret_1d": round(ret_1d, 2),
+                "sma200": round(sma200, 2),
+                "dist_200": round(dist_200, 2),
+            }
+        except Exception as e:
+            print(f"[WARN] 辅助拉取 {sym} 快照异常 (已忽略): {e}")
+    return snapshot
 
 
 def load_previous_state():
@@ -153,7 +184,6 @@ async def _wecom_aibot_send_async(bot_id, secret, chat_id, title, content):
     async with websockets.connect(
         WECOM_WS_URL, open_timeout=10, close_timeout=5, ping_interval=None, compression=None
     ) as ws:
-        # 1. 发送 aibot_subscribe 鉴权帧
         await ws.send(
             json.dumps(
                 {
@@ -168,7 +198,6 @@ async def _wecom_aibot_send_async(bot_id, secret, chat_id, title, content):
         if auth_resp.get("errcode") != 0:
             raise RuntimeError(f"长连接鉴权失败: {auth_resp}")
 
-        # 2. 发送 aibot_send_msg 主动推送帧
         await ws.send(
             json.dumps(
                 {
@@ -182,7 +211,6 @@ async def _wecom_aibot_send_async(bot_id, secret, chat_id, title, content):
                 }
             )
         )
-        # 读取回执（跳过可能穿插的服务端事件帧）
         for _ in range(5):
             raw_ack = await asyncio.wait_for(ws.recv(), timeout=10)
             ack = json.loads(raw_ack)
@@ -255,9 +283,8 @@ async def bind_wecom_aibot_interactive(bot_id, secret, timeout_sec=300):
                             welcome_md = (
                                 "### ✅ TQQQ-LRS 哨兵长连接绑定成功！\n"
                                 f"- **绑定会话 ID**：`{chat_id}`\n"
-                                "- **监控标的**：`QQQ`（官方复权收盘价 vs 200MA）\n"
-                                "- **当前策略状态**：`LONG`（持有 TQQQ）\n"
-                                "- **运行计划**：北京时间每周二至周六 `07:30` 自动巡检，静默监控，变盘即报！"
+                                "- **监控标的**：`SPY / QQQ / TQQQ`（QQQ 复权收盘价 vs 200MA）\n"
+                                "- **运行计划**：北京时间每周二至周六 `10:00` 准时推送早报，穿刺 200MA 立即高亮报警！"
                             )
 
                             if cmd == "aibot_msg_callback" and req_id:
@@ -310,9 +337,8 @@ def _build_webhook_request(url, title, content, secret=""):
     """
     lower_url = url.lower()
 
-    # 1. 飞书 / Lark 群机器人（支持彩色交互式卡片 + 签名校验 + @所有人）
     if "feishu.cn" in lower_url or "larksuite.com" in lower_url:
-        header_color = "red" if "入场" in title or "买入" in title else "orange"
+        header_color = "red" if "入场" in title or "买入" in title else ("orange" if "离场" in title else "wathet")
         payload = {
             "msg_type": "interactive",
             "card": {
@@ -338,7 +364,6 @@ def _build_webhook_request(url, title, content, secret=""):
             payload["sign"] = base64.b64encode(hmac_code).decode("utf-8")
         return "飞书(Feishu)", url, payload
 
-    # 2. 企业微信群机器人（原生 Markdown + @all）
     if "qyapi.weixin.qq.com" in lower_url:
         payload = {
             "msgtype": "markdown",
@@ -348,7 +373,6 @@ def _build_webhook_request(url, title, content, secret=""):
         }
         return "企业微信(WeCom)", url, payload
 
-    # 3. 钉钉群机器人（原生 Markdown + @所有人 + 可选 SEC 加签）
     if "dingtalk.com" in lower_url:
         target_url = url
         if secret:
@@ -373,7 +397,6 @@ def _build_webhook_request(url, title, content, secret=""):
         }
         return "钉钉(DingTalk)", target_url, payload
 
-    # 4. 通用自定义 Webhook 兜底
     payload = {"title": title, "content": content, "text": f"{title}\n\n{content}"}
     return "自定义Webhook", url, payload
 
@@ -428,17 +451,14 @@ def send_notification(title, content):
             seen_urls.add(u)
             unique_webhooks.append((u, sec))
 
-    # 检查企业微信智能机器人长连接配置
     wecom_bot_id = _clean_env("WECOM_BOT_ID") or DEFAULT_WECOM_BOT_ID
     wecom_bot_secret = _clean_env("WECOM_BOT_SECRET")
     cached_state = load_previous_state()
     wecom_chat_id = _clean_env("WECOM_CHAT_ID") or str(cached_state.get("wecom_chat_id", "")).strip()
 
     pushplus_token = _clean_env("PUSHPLUS_TOKEN")
-
     has_aibot = bool(wecom_bot_id and wecom_bot_secret and wecom_chat_id)
 
-    # 未配置任何推送凭证时，仅控制台输出（本地演练模式）
     if not unique_webhooks and not has_aibot and not pushplus_token:
         print(
             f"[LOG - 未配置推送凭证，仅控制台输出]\n标题: {title}\n内容:\n{content}"
@@ -447,7 +467,6 @@ def send_notification(title, content):
 
     results = []
 
-    # 1. 企业微信智能机器人长连接 (WebSocket)
     if has_aibot:
         aibot_ok = False
         for attempt in range(3):
@@ -465,7 +484,6 @@ def send_notification(title, content):
                     time.sleep(3)
         results.append(aibot_ok)
 
-    # 2. 企业微信 / 飞书 / 钉钉 Webhook
     for raw_url, secret in unique_webhooks:
         platform_name, _, _ = _build_webhook_request(raw_url, title, content, secret)
 
@@ -485,7 +503,6 @@ def send_notification(title, content):
         ok = _post_with_retry(platform_name, make_req, check_im_resp)
         results.append(ok)
 
-    # 3. PushPlus 备用通道
     if pushplus_token:
         def make_pp_req():
             return "https://www.pushplus.plus/send", {
@@ -503,18 +520,49 @@ def send_notification(title, content):
     return any(results)
 
 
+def _format_extra_snapshot_lines(snapshot, qqq_close, qqq_sma200, diff_pct):
+    """格式化 SPY / QQQ / TQQQ 极简客观行情行"""
+    lines = []
+    spy = snapshot.get("SPY")
+    qqq = snapshot.get("QQQ")
+    tqqq = snapshot.get("TQQQ")
+
+    if spy:
+        spy_tag = "🟢 >200MA" if spy["close"] >= spy["sma200"] else "🔴 <200MA"
+        lines.append(
+            f"- **标普 500 (`SPY`)**：`${spy['close']:.2f}` (`{spy['ret_1d']:+.2f}%`) | "
+            f"200MA: `${spy['sma200']:.2f}` (`{spy['dist_200']:+.2f}%` {spy_tag})"
+        )
+    if qqq:
+        lines.append(
+            f"- **纳指 100 (`QQQ`)**：`${qqq_close:.2f}` (`{qqq['ret_1d']:+.2f}%`) | "
+            f"200MA: `${qqq_sma200:.2f}` (`{diff_pct:+.2f}%`)"
+        )
+    else:
+        lines.append(
+            f"- **纳指 100 (`QQQ`)**：`${qqq_close:.2f}` | 200MA: `${qqq_sma200:.2f}` (`{diff_pct:+.2f}%`)"
+        )
+    if tqqq:
+        lines.append(
+            f"- **3倍纳指 (`TQQQ`)**：`${tqqq['close']:.2f}` (`{tqqq['ret_1d']:+.2f}%`) | "
+            f"200MA: `${tqqq['sma200']:.2f}` (`{tqqq['dist_200']:+.2f}%`)"
+        )
+    return "\n".join(lines)
+
+
 def main():
-    # 支持通过 `python main.py --bind` 启动企业微信智能机器人长连接会话 ID 自动捕获
     if "--bind" in sys.argv:
         bot_id = _clean_env("WECOM_BOT_ID") or DEFAULT_WECOM_BOT_ID
         secret = _clean_env("WECOM_BOT_SECRET")
         if not secret:
-            sys.exit("请先设置环境变量 WECOM_BOT_SECRET（企业微信长连接页面 Bot ID 下方的 Secret）再运行 --bind")
+            sys.exit("请先设置环境变量 WECOM_BOT_SECRET 再运行 --bind")
         asyncio.run(bind_wecom_aibot_interactive(bot_id, secret))
         return
 
     trade_date, close_price, sma_200 = get_qqq_data_with_retry()
     diff_pct = ((close_price - sma_200) / sma_200) * 100
+    cushion_dollar = close_price - sma_200
+    cushion_drop_pct = ((sma_200 - close_price) / close_price) * 100
 
     # 计算最新状态（Close >= SMA200 为 LONG，否则为 CASH）
     current_state = "LONG" if close_price >= sma_200 else "CASH"
@@ -546,12 +594,15 @@ def main():
         )
         return
 
-    # 休市/重复运行防抖：如果最新交易日与已记录状态日期相同且状态一致，直接静默退出
-    if trade_date == last_date and current_state == last_state:
+    # 休市/重复运行防抖：如果最新交易日与已记录状态日期相同且状态一致（且未传 --force），直接静默退出
+    if trade_date == last_date and current_state == last_state and "--force" not in sys.argv:
         print(f"交易日 {trade_date} 已处理且状态未变（可能为美股休市日或重复执行），保持静默。")
         return
 
-    # 核心状态机校验：仅在状态翻转时报警
+    snapshot = get_market_snapshot()
+    snapshot_md = _format_extra_snapshot_lines(snapshot, close_price, sma_200, diff_pct)
+
+    # 核心状态机校验：状态翻转时发特级指令，状态未变但进入新交易日时发每日例行简报
     if current_state != last_state:
         if current_state == "LONG":
             title = "🚨【入场指令】QQQ 突破 200MA，建仓 TQQQ！"
@@ -560,7 +611,8 @@ def main():
                 f"- **触发日期**：{trade_date}（昨夜美股收盘）\n"
                 f"- **QQQ 复权收盘价**：`${close_price:.2f}`\n"
                 f"- **QQQ 200MA**：`${sma_200:.2f}`\n"
-                f"- **向上偏离幅度**：`{diff_pct:+.2f}%`\n"
+                f"- **向上偏离幅度**：`{diff_pct:+.2f}%`\n\n"
+                f"### 📊 三大标的收盘实况\n{snapshot_md}\n\n"
                 f"- **👉 操作建议**：**买入 / 持有 TQQQ**\n\n"
                 f"> 原防守仓位（现金/短债 SGOV/BIL）请于今晚美股开盘全额置换为 TQQQ。\n\n"
                 f"> ⚠️ *免责声明：本信号由量化模型自动生成，仅供参考，不构成投资建议，据此操作风险自负。*"
@@ -572,13 +624,14 @@ def main():
                 f"- **触发日期**：{trade_date}（昨夜美股收盘）\n"
                 f"- **QQQ 复权收盘价**：`${close_price:.2f}`\n"
                 f"- **QQQ 200MA**：`${sma_200:.2f}`\n"
-                f"- **向下偏离幅度**：`{diff_pct:+.2f}%`\n"
+                f"- **向下偏离幅度**：`{diff_pct:+.2f}%`\n\n"
+                f"### 📊 三大标的收盘实况\n{snapshot_md}\n\n"
                 f"- **👉 操作建议**：**清仓 TQQQ 换回现金/短债**\n\n"
                 f"> 市场已转入高风险防守期，请于今晚美股开盘全额卖出 TQQQ，转存 SGOV/BIL/现金。\n\n"
                 f"> ⚠️ *免责声明：本信号由量化模型自动生成，仅供参考，不构成投资建议，据此操作风险自负。*"
             )
 
-        print("检测到状态翻转！正在推送通知...")
+        print("检测到状态翻转！正在推送特级指令通知...")
         if send_notification(title, content):
             save_current_state(
                 {
@@ -594,7 +647,46 @@ def main():
         else:
             sys.exit("推送通知失败！为防止漏报，本次不更新 state.json，等待下次重试。")
     else:
-        print("状态未变，策略保持静默，不触发通知。")
+        # 状态未变：若开启每日简报模式 (DAILY_BRIEF=1，默认在云端开启或传 --daily)，发送每日客观实况早报
+        daily_enabled = _clean_env("DAILY_BRIEF", "0") == "1" or "--daily" in sys.argv
+        if daily_enabled:
+            state_badge = "🟢 LONG（持有 TQQQ）" if current_state == "LONG" else "🛡️ CASH（持有短债/现金）"
+            if current_state == "LONG":
+                safety_line = (
+                    f"QQQ 当前高于 200MA **`+${cushion_dollar:.2f}` (`{diff_pct:+.2f}%`)**，"
+                    f"需再跌 **`{cushion_drop_pct:.2f}%`** 至 `${sma_200:.2f}` 才会触发清仓线。"
+                )
+            else:
+                safety_line = (
+                    f"QQQ 当前低于 200MA **`-${abs(cushion_dollar):.2f}` (`{diff_pct:+.2f}%`)**，"
+                    f"需反弹 **`+{cushion_drop_pct:.2f}%`** 站上 `${sma_200:.2f}` 才会触发建仓线。"
+                )
+
+            title = f"📊【美股每日早报】{trade_date} | {state_badge}"
+            content = (
+                f"### 1️⃣ 标普500 / 纳指100 / TQQQ 收盘实况\n"
+                f"{snapshot_md}\n\n"
+                f"### 2️⃣ 200MA 趋势安全垫 (LRS 核心法则)\n"
+                f"- **当前策略状态**：**{state_badge}**（未发生状态翻转，无需调仓）\n"
+                f"- **生死线距离**：{safety_line}"
+            )
+            print("状态未变，正在推送每日客观早报...")
+            if send_notification(title, content):
+                save_current_state(
+                    {
+                        "schema_version": SCHEMA_VERSION,
+                        "last_state": current_state,
+                        "last_date": trade_date,
+                        "last_close": close_price,
+                        "last_sma200": sma_200,
+                        "updated_at": now_utc,
+                    }
+                )
+                print("每日早报已发送，交易日已更新。")
+            else:
+                sys.exit("每日早报推送失败！")
+        else:
+            print("状态未变，策略保持静默，不触发通知。")
 
 
 if __name__ == "__main__":

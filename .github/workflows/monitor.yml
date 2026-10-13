@@ -2,9 +2,8 @@ name: TQQQ LRS State Flip Monitor
 
 on:
   schedule:
-    # UTC 23:30 对应北京时间次日早晨 07:30 (周一至周五 UTC，对应北京时间周二至周六)
-    # 对应美东时间盘后 18:30 (冬令时) / 19:30 (夏令时)，收盘与除权数据已完全落定
-    - cron: '30 23 * * 1-5'
+    # UTC 02:00 (周二至周六) 对应北京时间每天上午 10:00 (周二至周六，即美股周一至周五收盘后)
+    - cron: '0 2 * * 2-6'
   workflow_dispatch: # 支持手动点击运行测试
 
 permissions:
@@ -31,6 +30,8 @@ jobs:
 
       - name: Run Sentinel
         env:
+          # 开启每日北京时间 10:00 推送 SPY/QQQ/TQQQ 极简早报（穿刺 200MA 时自动升级为特级调仓指令）
+          DAILY_BRIEF: "1"
           # 企业微信智能机器人长连接模式 (tqqq BOT)
           WECOM_BOT_ID: ${{ secrets.WECOM_BOT_ID }}
           WECOM_BOT_SECRET: ${{ secrets.WECOM_BOT_SECRET }}
