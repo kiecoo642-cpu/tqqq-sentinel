@@ -1,9 +1,9 @@
 {
   "schema_version": 1,
-  "last_state": "CASH",
-  "last_date": "2026-11-10",
-  "last_close": 674.76,
-  "last_sma200": 680.35,
-  "updated_at": "2026-11-11T08:54:32Z",
+  "last_state": "LONG",
+  "last_date": "2026-11-11",
+  "last_close": 690.38,
+  "last_sma200": 680.65,
+  "updated_at": "2026-11-12T09:21:42Z",
   "wecom_chat_id": "wrLMIlDQAAMtH710oFM0GFOnyHJozgzw"
 }
